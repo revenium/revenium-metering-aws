@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Revenium Lambda Metering Function
+
+Resources:
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/apigateway/revenium-metering-access-logs
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-api-log-processing-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                  - execute-api:ManageConnections
+                Resource: '*'
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: revenium-metering-log-processing-lambda
+      Runtime: python3.8
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import base64
+          import gzip
+          import json
+          import urllib.request
+          import os
+
+          def lambda_handler(event, context):
+              cw_data = base64.b64decode(event['awslogs']['data'])
+              uncompressed_data = gzip.decompress(cw_data)
+              log_data = json.loads(uncompressed_data)
+
+
+              for log_event in log_data['logEvents']:
+
+                  analytics_data = json.loads(log_event['message'])
+
+                  payload = {
+                      "method": analytics_data.get("httpMethod"),
+                      "url": analytics_data.get("path"),
+                      "application": analytics_data.get("principalId"),
+                      "responseCode": analytics_data.get("status"),
+                      "remoteHost": analytics_data.get("sourceIp"),
+                      "backendLatency": analytics_data.get("integrationLatency"),
+                      "responseMessageSize": analytics_data.get("responseLength"),
+                      "source": "AWS"
+                  }
+
+                  data = json.dumps(payload).encode('utf-8')
+
+                  url = os.environ.get('REVENIUM_PLATFORM_API', 'https://api.revenium.io/meter/v1/api/meter')
+                  api_key = os.environ.get('REVENIUM_PLATFORM_API_KEY', '')
+
+                  req = urllib.request.Request(url,
+                                               data=data, headers={'Content-Type': 'application/json',
+                                                                   'x-api-key': api_key}, method='POST')
+
+                  try:
+                      with urllib.request.urlopen(req) as response:
+                          response_body = response.read().decode('utf-8')
+                  except urllib.error.URLError as e:
+                      print("Error:", e.reason)
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Metering complete')
+              }
+      Environment:
+        Variables:
+          REVENIUM_PLATFORM_API_KEY: "REVENIUM_PLATFORM_API_KEY_HERE"
+      Timeout: 30
+      MemorySize: 128
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt LambdaFunction.Arn
